@@ -1,5 +1,5 @@
 // api/generate-image.js
-// 火山方舟 Doubao-Seedream 图像生成 - 修复版（简化参数）
+// 火山方舟 Doubao-Seedream 图像生成 - 修复URL逻辑版
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -24,7 +24,6 @@ export default async function handler(req, res) {
       response_format: 'url'
     };
 
-    // 图生图模式
     if (imageBase64) {
       if (imageBase64.startsWith('data:image')) {
         requestBody.image = imageBase64;
@@ -35,7 +34,6 @@ export default async function handler(req, res) {
 
     console.log('[AI] 请求模型:', MODEL_ID);
     console.log('[AI] 有图片:', !!imageBase64);
-    console.log('[AI] 请求体:', JSON.stringify({...requestBody, image: requestBody.image ? '[base64]' : undefined}));
 
     const response = await fetch('https://ark.cn-beijing.volces.com/api/v3/images/generations', {
       method: 'POST',
@@ -63,14 +61,21 @@ export default async function handler(req, res) {
       });
     }
 
-    const imageUrl = data?.data?.[0]?.url || data?.data?.[0]?.b64_json 
-      ? `data:image/png;base64,${data.data[0].b64_json}` : null;
+    // 修复：优先用 url，url 不存在才用 b64_json
+    let imageUrl = null;
+    if (data?.data?.[0]?.url) {
+      imageUrl = data.data[0].url;
+      console.log('[AI] 使用URL格式');
+    } else if (data?.data?.[0]?.b64_json) {
+      imageUrl = `data:image/png;base64,${data.data[0].b64_json}`;
+      console.log('[AI] 使用base64格式');
+    }
 
     if (!imageUrl) {
       return res.status(500).json({ error: '无法提取图片', detail: JSON.stringify(data).substring(0, 300) });
     }
 
-    console.log('[AI] 成功');
+    console.log('[AI] 成功，图片URL前50字符:', imageUrl.substring(0, 50));
     return res.status(200).json({ imageUrl });
 
   } catch (error) {
