@@ -860,7 +860,8 @@ function generatePattern(params) {
   const src = aiProcessedImage || originalImage;
   if (!src) return;
   
-  const processed = processImage(src, params);
+  // 先抠图，再做其他处理
+  const cutoutOnly = processImage(src, {cutoutEnabled: params.cutoutEnabled, cutout: params.cutout, edge: 0, smooth: 0});
   
   const c = document.createElement('canvas');
   const t = c.getContext('2d');
@@ -873,87 +874,69 @@ function generatePattern(params) {
   else { dh = gridH; dw = gridH*ratio; ox = (gridW-dw)/2; oy = 0; }
   
   const draw = () => {
-    t.drawImage(processed, ox, oy, dw, dh);
+    // 用最近邻缩放，保持像素清晰（不要平滑）
+    t.imageSmoothingEnabled = false;
+    t.drawImage(cutoutOnly, ox, oy, dw, dh);
     const imgData = t.getImageData(0, 0, gridW, gridH);
     const d = imgData.data;
     
-    // 第一步：像素化，每个格子取颜色
-    const cellClusters = [];
-    const pixels = [];
-    for (let y = 0; y < gridH; y++) {
-      cellClusters[y] = [];
-      for (let x = 0; x < gridW; x++) {
-        const i = (y*gridW+x)*4;
-        if (d[i+3] < 128) { cellClusters[y][x] = null; continue; }
-        cellClusters[y][x] = [d[i], d[i+1], d[i+2]];
-        pixels.push([d[i], d[i+1], d[i+2]]);
-      }
-    }
-    if (pixels.length === 0) { alert('图片全透明，请调整抠图容差'); return; }
-    
-    // 第二步：颜色量化（K-means）
-    const k = Math.min(targetColorCount, pixels.length);
-    const clusters = kmeans(pixels, k, 20);
-    
-    // 把每个格子映射到聚类索引
-    for (let y = 0; y < gridH; y++) {
-      for (let x = 0; x < gridW; x++) {
-        if (cellClusters[y][x] !== null) {
-          cellClusters[y][x] = findClosestCluster(cellClusters[y][x], clusters);
-        }
-      }
-    }
-    
-    // 第三步：黑色轮廓描边 - 检测颜色变化的边缘
-    const isEdge = [];
-    for (let y = 0; y < gridH; y++) {
-      isEdge[y] = [];
-      for (let x = 0; x < gridW; x++) {
-        isEdge[y][x] = false;
-        if (cellClusters[y][x] === null) continue;
-        const cur = cellClusters[y][x];
-        const dirs = [[0,-1],[0,1],[-1,0],[1,0]];
-        for (const [dx, dy] of dirs) {
-          const nx = x+dx, ny = y+dy;
-          if (nx<0||nx>=gridW||ny<0||ny>=gridH) { isEdge[y][x]=true; break; }
-          const nb = cellClusters[ny][nx];
-          if (nb === null || nb !== cur) { isEdge[y][x]=true; break; }
-        }
-      }
-    }
-    
-    // 第四步：匹配MARD色号（包含黑色H7用于轮廓）
-    const blackIdx = MARD_PALETTE.findIndex(m => m.code === 'H7');
-    const mardIndices = clusters.map(center => findClosestMard(center));
-    const uniqueMard = [...new Set([...mardIndices, blackIdx])];
-    usedColors = uniqueMard.map(idx => MARD_PALETTE[idx]);
-    const clusterToMard = mardIndices.map(idx => uniqueMard.indexOf(idx));
-    const blackMardIdx = uniqueMard.indexOf(blackIdx);
-    
-    // 第五步：生成格子（轮廓用黑色，其他用量化颜色）
+    // 直接读取每个格子的颜色，匹配最近的MARD色号（不需要K-means）
+    const mardIdxMap = {}; // 缓存颜色到MARD索引的映射
     beadGrid = [];
     const counts = {};
+    const usedMardSet = new Set();
+    
     for (let y = 0; y < gridH; y++) {
       beadGrid[y] = [];
       for (let x = 0; x < gridW; x++) {
-        if (cellClusters[y][x] === null) { beadGrid[y][x] = null; continue; }
-        if (isEdge[y][x]) {
-          beadGrid[y][x] = blackMardIdx;
-        } else {
-          beadGrid[y][x] = clusterToMard[cellClusters[y][x]];
+        const i = (y*gridW+x)*4;
+        // 透明区域设为null（抠图生效）
+        if (d[i+3] < 128) { beadGrid[y][x] = null; continue; }
+        
+        // 白色背景也视为空（如果开启了抠图）
+        if (params.cutoutEnabled && d[i] > 240 && d[i+1] > 240 && d[i+2] > 240) {
+          beadGrid[y][x] = null; continue;
         }
-        counts[beadGrid[y][x]] = (counts[beadGrid[y][x]] || 0) + 1;
+        
+        const rgb = [d[i], d[i+1], d[i+2]];
+        const key = rgb.join(',');
+        let mardIdx;
+        if (mardIdxMap[key]) {
+          mardIdx = mardIdxMap[key];
+        } else {
+          mardIdx = findClosestMard(rgb);
+          mardIdxMap[key] = mardIdx;
+        }
+        beadGrid[y][x] = mardIdx;
+        usedMardSet.add(mardIdx);
+        counts[mardIdx] = (counts[mardIdx] || 0) + 1;
       }
     }
-    usedColors.forEach((c, i) => { c.count = counts[i] || 0; });
+    
+    // 构建usedColors
+    const usedMardArr = [...usedMardSet].sort((a,b) => (counts[b]||0) - (counts[a]||0));
+    usedColors = usedMardArr.map(idx => ({...MARD_PALETTE[idx], count: counts[idx]||0}));
+    const mardToGridIdx = {};
+    usedMardArr.forEach((mardIdx, gridIdx) => { mardToGridIdx[mardIdx] = gridIdx; });
+    
+    // 把beadGrid里的MARD索引转换成usedColors索引
+    for (let y = 0; y < gridH; y++) {
+      for (let x = 0; x < gridW; x++) {
+        if (beadGrid[y][x] !== null) {
+          beadGrid[y][x] = mardToGridIdx[beadGrid[y][x]];
+        }
+      }
+    }
+    
+    if (usedColors.length === 0) { alert('图片全透明，请调整抠图容差'); return; }
     
     drawPattern();
     updateColorGrid();
     updateStatus();
   };
   
-  if (processed.complete) draw();
-  else processed.onload = draw;
+  if (cutoutOnly.complete) draw();
+  else cutoutOnly.onload = draw;
 }
 
 // ==================== 图像处理 ====================
