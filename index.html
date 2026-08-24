@@ -397,6 +397,29 @@
           <button id="liveApplyBtn" class="w-full py-2 rounded-lg bg-indigo-100 text-indigo-700 text-sm font-medium">🔄 应用并重新生成</button>
         </div>
       </div>
+      <div class="border-t border-gray-200 pt-4">
+        <h4 class="font-medium text-sm mb-2">📊 图纸统计</h4>
+        <div class="bg-gray-50 rounded-lg p-3 space-y-2">
+          <div class="flex justify-between text-sm">
+            <span class="text-gray-500">图纸尺寸</span>
+            <span id="statSize" class="font-bold">-</span>
+          </div>
+          <div class="flex justify-between text-sm">
+            <span class="text-gray-500">豆子总数</span>
+            <span id="statTotal" class="font-bold text-indigo-600">-</span>
+          </div>
+          <div class="flex justify-between text-sm">
+            <span class="text-gray-500">使用色号</span>
+            <span id="statColorCount" class="font-bold text-green-600">-</span>
+          </div>
+        </div>
+        <div class="mt-2">
+          <p class="text-xs text-gray-500 mb-1">色号明细：</p>
+          <div id="statColorList" class="space-y-1 max-h-40 overflow-y-auto">
+            <p class="text-xs text-gray-400">暂无数据</p>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -689,6 +712,25 @@ function drawEmptyGrid() {
 function updateStatus() {
   const total = usedColors.reduce((s,c) => s+c.count, 0);
   $('statusInfo').textContent = beadGrid.length ? `${gridW}×${gridH} · ${usedColors.length}色 · ${total}颗` : `${gridW}×${gridH} 空图纸`;
+  
+  // 更新工具面板统计
+  if ($('statSize')) $('statSize').textContent = `${gridW} × ${gridH}`;
+  if ($('statTotal')) $('statTotal').textContent = total + ' 颗';
+  if ($('statColorCount')) $('statColorCount').textContent = usedColors.length + ' 色';
+  
+  // 更新色号明细列表
+  const listEl = $('statColorList');
+  if (listEl && usedColors.length > 0) {
+    const sorted = [...usedColors].sort((a,b) => b.count - a.count);
+    listEl.innerHTML = sorted.map(c => `
+      <div class="flex items-center gap-2 text-xs">
+        <div class="w-4 h-4 rounded border border-gray-300 flex-shrink-0" style="background:${c.hex}"></div>
+        <span class="font-bold">${c.code}</span>
+        <span class="text-gray-500 flex-1 truncate">${c.name}</span>
+        <span class="text-gray-400">${c.count}</span>
+      </div>
+    `).join('');
+  }
 }
 
 // ==================== 弹窗控制 ====================
@@ -977,31 +1019,54 @@ function processImage(src, params) {
     imgData = t.getImageData(0, 0, c.width, c.height);
   }
   
+  // PS魔棒原理抠图：全局颜色范围选择（所有相似颜色都抠掉，不只是连通区域）
   if (params.cutoutEnabled && params.cutout > 0) {
     const dd = imgData.data;
     const w = c.width, h = c.height;
+    
+    // 采样多个边缘点的颜色作为背景色参考
     const samples = [];
-    const samplePoints = [[0,0],[w-1,0],[0,h-1],[w-1,h-1],[Math.floor(w/2),0],[Math.floor(w/2),h-1],[0,Math.floor(h/2)],[w-1,Math.floor(h/2)]];
-    samplePoints.forEach(([x,y]) => { const i = (y*w+x)*4; if (dd[i+3] > 128) samples.push([dd[i],dd[i+1],dd[i+2]]); });
+    const samplePoints = [
+      [0,0],[w-1,0],[0,h-1],[w-1,h-1],
+      [Math.floor(w/4),0],[Math.floor(w*3/4),0],
+      [Math.floor(w/4),h-1],[Math.floor(w*3/4),h-1],
+      [0,Math.floor(h/4)],[0,Math.floor(h*3/4)],
+      [w-1,Math.floor(h/4)],[w-1,Math.floor(h*3/4)],
+      [Math.floor(w/2),0],[Math.floor(w/2),h-1],
+      [0,Math.floor(h/2)],[w-1,Math.floor(h/2)]
+    ];
+    samplePoints.forEach(([x,y]) => {
+      const i = (y*w+x)*4;
+      if (dd[i+3] > 128) samples.push([dd[i],dd[i+1],dd[i+2]]);
+    });
+    
     if (samples.length > 0) {
+      // 计算平均背景色
       let br=0, bg=0, bb=0;
       samples.forEach(s => { br+=s[0]; bg+=s[1]; bb+=s[2]; });
-      br = br/samples.length|0; bg = bg/samples.length|0; bb = bb/samples.length|0;
-      const visited = new Uint8Array(w*h);
-      const queue = [];
-      for (let x = 0; x < w; x++) { queue.push([x,0]); queue.push([x,h-1]); }
-      for (let y = 0; y < h; y++) { queue.push([0,y]); queue.push([w-1,y]); }
+      br = br/samples.length|0;
+      bg = bg/samples.length|0;
+      bb = bb/samples.length|0;
+      
+      // 全局抠图：所有与背景色相似的像素都设为透明
+      // 容差范围 0-150（cutout 0-100 * 1.5）
       const tol = params.cutout * 1.5;
-      while (queue.length > 0) {
-        const [x, y] = queue.pop();
-        if (x < 0 || x >= w || y < 0 || y >= h) continue;
-        const idx = y*w+x;
-        if (visited[idx]) continue;
-        visited[idx] = 1;
-        const i = idx*4;
-        if (dd[i+3] < 128) continue;
-        const dist = Math.sqrt((dd[i]-br)**2 + (dd[i+1]-bg)**2 + (dd[i+2]-bb)**2);
-        if (dist < tol) { dd[i+3] = 0; queue.push([x+1,y],[x-1,y],[x,y+1],[x,y-1]); }
+      const tolSq = tol * tol;
+      
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          const i = (y*w+x)*4;
+          if (dd[i+3] < 128) continue;
+          // 加权颜色距离（人眼对绿色更敏感）
+          const rmean = (dd[i] + br) / 2;
+          const dr = dd[i] - br;
+          const dg = dd[i+1] - bg;
+          const db = dd[i+2] - bb;
+          const distSq = (2 + rmean/256) * dr*dr + 4 * dg*dg + (2 + (255-rmean)/256) * db*db;
+          if (distSq < tolSq) {
+            dd[i+3] = 0; // 设为透明
+          }
+        }
       }
     }
     t.putImageData(imgData, 0, 0);
@@ -1080,16 +1145,16 @@ function drawPattern() {
     }
   }
   
-  // 网格线
-  ctx.strokeStyle = '#d1d5db';
-  ctx.lineWidth = 0.5;
+  // 网格线（很淡，不影响图案）
+  ctx.strokeStyle = '#e5e7eb';
+  ctx.lineWidth = 0.3;
   for (let i = 0; i <= gridW; i++) { ctx.beginPath(); ctx.moveTo(i*cell, 0); ctx.lineTo(i*cell, canvas.height); ctx.stroke(); }
   for (let i = 0; i <= gridH; i++) { ctx.beginPath(); ctx.moveTo(0, i*cell); ctx.lineTo(canvas.width, i*cell); ctx.stroke(); }
-  // 每5格粗线
-  ctx.strokeStyle = '#6b7280';
-  ctx.lineWidth = 1.5;
-  for (let i = 0; i <= gridW; i += 5) { ctx.beginPath(); ctx.moveTo(i*cell, 0); ctx.lineTo(i*cell, canvas.height); ctx.stroke(); }
-  for (let i = 0; i <= gridH; i += 5) { ctx.beginPath(); ctx.moveTo(0, i*cell); ctx.lineTo(canvas.width, i*cell); ctx.stroke(); }
+  // 每10格淡线（标尺参考，很淡）
+  ctx.strokeStyle = '#d1d5db';
+  ctx.lineWidth = 0.5;
+  for (let i = 0; i <= gridW; i += 10) { ctx.beginPath(); ctx.moveTo(i*cell, 0); ctx.lineTo(i*cell, canvas.height); ctx.stroke(); }
+  for (let i = 0; i <= gridH; i += 10) { ctx.beginPath(); ctx.moveTo(0, i*cell); ctx.lineTo(canvas.width, i*cell); ctx.stroke(); }
   
   // 色号文字
   if (cell > 10) {
